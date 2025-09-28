@@ -1,133 +1,177 @@
 from flask import Flask, request, jsonify
-import pandas as pd
-import joblib
-from predict_damage_for_city import predict_damage_for_city
-import predict_damage_with_model
-from haversine_distance import haversine_distance
+import requests
+import math
+import geojson
 
 app = Flask(__name__)
 
-# ====== Load Model and Scalers ======
-model = joblib.load("rf_model.pkl")
-scaler_X = joblib.load("scaler_X.pkl")
-scaler_y = joblib.load("scaler_y.pkl")
+# ======================================================
+# === USGS Elevation API ===============================
+# ======================================================
+def get_elevation_usgs(lat, lon):
+    try:
+        url = f"https://nationalmap.gov/epqs/pqs.php?x={lon}&y={lat}&units=Meters&output=json"
+        r = requests.get(url, timeout=6)
+        data = r.json()
+        elevation = data["USGS_Elevation_Point_Query_Service"]["Elevation_Query"]["Elevation"]
+        return float(elevation)
+    except Exception as e:
+        print(f"[get_elevation_usgs] Error: {e}")
+        return None
 
-# ====== Load Data ======
-df_asteroids = pd.read_csv("top_100_real_nasa_asteroids_with_coords.csv")
-df_cities = pd.read_csv("worldcities.csv", usecols=["city","lat","lng","country"])
+def is_water(lat, lon):
+    elev = get_elevation_usgs(lat, lon)
+    if elev is not None:
+        return elev <= 0, "usgs_api", elev
+    return False, "fallback_default_land", None
 
-# Clean text columns
-df_asteroids["Object"] = df_asteroids["Object"].astype(str).str.strip().str.lower()
-df_cities["city"] = df_cities["city"].astype(str).str.strip().str.lower()
+# ======================================================
+# === Damage Calculations ==============================
+# ======================================================
+def calculate_energy(diameter_m, velocity_kms, density=3000):
+    radius_m = diameter_m / 2.0
+    volume_m3 = (4.0 / 3.0) * math.pi * (radius_m ** 3)
+    mass_kg = volume_m3 * density
+    velocity_ms = velocity_kms * 1000.0
+    energy_joules = 0.5 * mass_kg * (velocity_ms ** 2)
+    return energy_joules
 
-# Drop rows with missing coordinates
-df_asteroids = df_asteroids.dropna(subset=['asteroid_lat','asteroid_lon'])
-df_cities = df_cities.dropna(subset=['lat','lng'])
+def calculate_crater_diameter(diameter_m, velocity_kms):
+    return diameter_m * (velocity_kms ** 0.44)
 
+def calculate_blast_radius(energy_joules):
+    return (energy_joules ** (1.0 / 3.0)) / 1000.0  # km
 
-#   Home Route
+def calculate_earthquake_magnitude(energy_joules):
+    if energy_joules <= 0:
+        return 0.0
+    return (2.0 / 3.0) * (math.log10(energy_joules) - 4.8)
 
+# ======================================================
+# === GeoJSON Generator ================================
+# ======================================================
+def make_geojson(lat, lon, blast_radius_km, crater_diam_m):
+    features = [
+        geojson.Feature(
+            geometry=geojson.Point((lon, lat)),
+            properties={"role": "impact_point"}
+        ),
+        geojson.Feature(
+            geometry=geojson.Point((lon, lat)),
+            properties={"role": "blast_zone_center", "radius_km": blast_radius_km}
+        ),
+        geojson.Feature(
+            geometry=geojson.Point((lon, lat)),
+            properties={"role": "crater_center", "radius_m": crater_diam_m}
+        )
+    ]
+    return geojson.FeatureCollection(features)
+
+# ======================================================
+# === Haversine Distance ===============================
+# ======================================================
+def haversine_distance(lat1, lon1, lat2, lon2):
+    R = 6371  # km
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    d_phi = math.radians(lat2 - lat1)
+    d_lambda = math.radians(lon2 - lon1)
+    a = math.sin(d_phi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(d_lambda/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    return R * c
+
+# ======================================================
+# === Volcanic Impact =================================
+# ======================================================
+def is_volcanic_area(lat, lon, energy_joules):
+    volcanoes = [
+        {"name": "Mount St. Helens", "lat": 46.2, "lon": -122.18, "radius_km": 50},
+        {"name": "Kilauea", "lat": 19.4, "lon": -155.3, "radius_km": 50},
+        {"name": "Mount Rainier", "lat": 46.85, "lon": -121.75, "radius_km": 50}
+    ]
+    for v in volcanoes:
+        dist = haversine_distance(lat, lon, v["lat"], v["lon"])
+        if dist <= v["radius_km"]:
+            if energy_joules > 1e19:
+                impact_level = "high"
+            elif energy_joules > 1e17:
+                impact_level = "medium"
+            else:
+                impact_level = "low"
+            return True, v["name"], impact_level
+    return False, None, None
+
+# ======================================================
+# === Flask Routes =====================================
+# ======================================================
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
-        "message": "API is running. Try /predict or /predict_city using POST"
+        "message": "🌍 Asteroid Impact API is running (volcanic impact only, no tsunami)!",
+        "usage": {
+            "endpoint": "/impact",
+            "method": "POST",
+            "example_payload": {
+                "diameter_m": 500,
+                "velocity_kms": 20,
+                "lat": 36.0,
+                "lon": -120.0
+            }
+        }
     })
 
+@app.route("/impact", methods=["POST"])
+def impact():
+    data = request.get_json(force=True)
 
-#   API 1: Predict Damage
-@app.route("/predict", methods=["POST"])
-def predict():
-    try:
-        data = request.json
-        diameter_m = data.get("diameter_m", 0)
+    diameter_m = float(data.get("diameter_m", 100.0))
+    velocity_kms = float(data.get("velocity_kms", 20.0))
+    lat = float(data.get("lat", 0.0))
+    lon = float(data.get("lon", 0.0))
 
-        # Case: "Earth completely destroyed"
-        if diameter_m >= 12742000:
-            return jsonify({
-                "message": "Asteroid diameter exceeds Earth's diameter! Earth is completely destroyed!"
-            })
+    # calculations
+    energy = calculate_energy(diameter_m, velocity_kms)
+    crater_diam_m = calculate_crater_diameter(diameter_m, velocity_kms)
+    crater_diam_km = crater_diam_m / 1000.0
+    blast_radius_km = calculate_blast_radius(energy)
+    magnitude = calculate_earthquake_magnitude(energy)
 
-        if "city" in data:
-            city_name = data["city"].strip().lower()
-            city_row = df_cities[df_cities["city"] == city_name]
+    # water check (keep for reference, but no tsunami calculation)
+    water_bool, water_source, elevation_m = is_water(lat, lon)
 
-            if city_row.empty:
-                return jsonify({"error": f"City '{data['city']}' not found"}), 400
-            city_row = city_row.iloc[0]
+    # volcanic check
+    volcanic_bool, volcano_name, impact_level = is_volcanic_area(lat, lon, energy)
 
-            if "asteroid" in data and data["asteroid"]:
-                # Use traditional predict_damage_for_city function
-                result = predict_damage_for_city(
-                    asteroid=data["asteroid"],
-                    city=data["city"],
-                    df_asteroids=df_asteroids,
-                    df_cities=df_cities,
-                    model=model,
-                    scaler_X=scaler_X,
-                    scaler_y=scaler_y
-                )
-            else:
-                # Use direct asteroid data
-                crater, blast = predict_damage_with_model.predict_damage_with_model(
-                    diameter_m=data["diameter_m"],
-                    velocity_kms=data["velocity_kms"],
-                    lat=city_row["lat"],
-                    lon=city_row["lng"],
-                    delta_km=data.get("delta_km", 1000),
-                    model=model,
-                    scaler_X=scaler_X,
-                    scaler_y=scaler_y
-                )
+    # GeoJSON
+    geojson_data = make_geojson(lat, lon, blast_radius_km, crater_diam_m)
 
-                distance = 0.0
-                is_city_affected = distance < blast
+    return jsonify({
+        "input": {
+            "diameter_m": diameter_m,
+            "velocity_kms": velocity_kms,
+            "lat": lat,
+            "lon": lon
+        },
+        "location": {
+            "is_water": water_bool,
+            "is_water_source": water_source,
+            "elevation_m": elevation_m
+        },
+        "results": {
+            "energy_joules": energy,
+            "crater_diameter_m": crater_diam_m,
+            "crater_diameter_km": crater_diam_km,
+            "blast_radius_km": blast_radius_km,
+            "earthquake_magnitude": magnitude
+        },
+        "volcanic_impact": {
+            "is_affected": volcanic_bool,
+            "volcano_name": volcano_name,
+            "impact_level": impact_level
+        },
+        "geojson": geojson_data
+    })
 
-                result = {
-                    "crater_diam_km": round(crater, 2),
-                    "blast_radius_km": round(blast, 2),
-                    "distance_km": round(distance, 2),
-                    "is_city_affected": is_city_affected
-                }
-
-            return jsonify(result)
-
-        else:
-            # Predict using coordinates directly
-            crater, blast = predict_damage_with_model.predict_damage_with_model(
-                diameter_m=data["diameter_m"],
-                velocity_kms=data["velocity_kms"],
-                lat=data.get("lat", 0.0),
-                lon=data.get("lon", 0.0),
-                delta_km=data.get("delta_km", 1000),
-                model=model,
-                scaler_X=scaler_X,
-                scaler_y=scaler_y
-            )
-            return jsonify({
-                "crater_diam_km": round(crater, 2),
-                "blast_radius_km": round(blast, 2)
-            })
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-#   API 2: Predict City Damage
-
-@app.route("/predict_city", methods=["POST"])
-def predict_city():
-    try:
-        data = request.json
-        asteroid = data["asteroid"]
-        city = data["city"]
-
-        result = predict_damage_for_city(
-            asteroid, city, df_asteroids, df_cities,
-            model, scaler_X, scaler_y
-        )
-
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
+# ======================================================
 if __name__ == "__main__":
     app.run(debug=True)
