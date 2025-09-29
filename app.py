@@ -131,6 +131,12 @@ def impact():
     lat = float(data.get("lat", 0.0))
     lon = float(data.get("lon", 0.0))
 
+    EARTH_DIAMETER_M = 12742000
+    catastrophic_flag = False
+    catastrophic_message = None
+    if diameter_m >= EARTH_DIAMETER_M:
+        catastrophic_flag = True
+        catastrophic_message = "Total destruction!"
     # calculations
     energy = calculate_energy(diameter_m, velocity_kms)
     crater_diam_m = calculate_crater_diameter(diameter_m, velocity_kms)
@@ -170,6 +176,10 @@ def impact():
             "is_affected": volcanic_bool,
             "volcano_name": volcano_name,
             "impact_level": impact_level
+        },
+        "catastrophic_impact": {
+           "catastrophic_destruction": catastrophic_flag,
+           "catastrophic_message": catastrophic_message
         },
         "geojson": geojson_data
     })
