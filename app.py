@@ -1,9 +1,11 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import requests
 import math
 import geojson
 
 app = Flask(__name__)
+CORS(app) 
 
 # ======================================================
 # === USGS Elevation API ===============================
