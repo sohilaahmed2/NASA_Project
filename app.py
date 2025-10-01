@@ -3,9 +3,21 @@ from flask_cors import CORS
 import requests
 import math
 import geojson
+import pandas as pd
 
+asteroids_df = pd.read_csv("top_100_real_nasa_asteroids_with_coords.csv")
 app = Flask(__name__)
 CORS(app) 
+
+def get_asteroid_data(name):
+    row = asteroids_df[asteroids_df["Object"] == name]
+    if not row.empty:
+        diameter = float(row.iloc[0]['diameter_m'])
+        velocity = float(row.iloc[0]['V relative(km/s)'])
+        lat = float(row.iloc[0]['asteroid_lat'])
+        lon = float(row.iloc[0]['asteroid_lon'])
+        return diameter, velocity, lat, lon
+    return None
 
 # ======================================================
 # === USGS Elevation API ===============================
@@ -126,10 +138,18 @@ def home():
 def impact():
     data = request.get_json(force=True)
 
-    diameter_m = float(data.get("diameter_m", 100.0))
-    velocity_kms = float(data.get("velocity_kms", 20.0))
-    lat = float(data.get("lat", 0.0))
-    lon = float(data.get("lon", 0.0))
+    asteroid_name = data.get("asteroid")
+
+    if asteroid_name:
+        asteroid_data = get_asteroid_data(asteroid_name)
+        if asteroid_data is None:
+            return jsonify({"error": "Asteroid not found"}), 404
+        diameter_m, velocity_kms, lat, lon = asteroid_data
+    else:
+        diameter_m = float(data.get("diameter_m", 100.0))
+        velocity_kms = float(data.get("velocity_kms", 20.0))
+        lat = float(data.get("lat", 0.0))
+        lon = float(data.get("lon", 0.0))
 
     EARTH_DIAMETER_M = 12742000
     catastrophic_flag = False
@@ -181,9 +201,12 @@ def impact():
            "catastrophic_destruction": catastrophic_flag,
            "catastrophic_message": catastrophic_message
         },
-        "geojson": geojson_data
+        "geojson": geojson_data,
+        "catastrophic_destruction": catastrophic_flag,
+        "catastrophic_message": catastrophic_message
     })
 
 # ======================================================
 if __name__ == "__main__":
     app.run(debug=True)
+
