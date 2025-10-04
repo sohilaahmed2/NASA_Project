@@ -1,9 +1,12 @@
 flask
 flask-cors
+requests
 pandas
 scikit-learn
 joblib
 geojson
+python-dotenv
+google-generativeai
 
 
 
